@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <assert.h>
+#include <arpa/inet.h>
 
 #include "mapreduce.h"
 
@@ -46,13 +47,18 @@ map_main(void *arg)
 {
 	struct map_arg *ma = arg;
 
+        if (connect(ma->mr->clifd[ma->id],(struct sockaddr *)&ma->mr->server_addr, sizeof(ma->mr->server_addr)) < 0) 
+	perror("ERROR connecting");
 	
-        //if (connect(ma->mr->clifd[ma->id],(struct sockaddr *)&ma->mr->server_addr, sizeof(ma->mr->server_addr)) < 0) 
-	//perror("ERROR connecting");
+	int maprv = 0;
 	
-
+	if (ma->mr->map == NULL) {
+	    maprv = -1;    
+	}	
+	
 	// Run map callback
-	int maprv = ma->mr->map(ma->mr, ma->infd, ma->id, ma->mr->nmaps);
+	if (maprv >= 0)
+	   maprv = ma->mr->map(ma->mr, ma->mr->clifd[ma->id], ma->id, ma->mr->nmaps);
 
 	// Close input file
 	close(ma->infd);
@@ -68,6 +74,11 @@ map_main(void *arg)
 	}
 	rvs->rv = maprv;
 
+	if (rvs == NULL) {
+		free(rvs);
+		return NULL;
+	}
+
 	return rvs;
 }
 
@@ -79,16 +90,28 @@ struct reduce_arg {
 /* Code for reduce worker */
 static void * reduce_main(void *arg)
 {
-	// accept() should happen in this function
-  
+	// accept() should happen in this function 
   
 	// wait for a specific number of connections then do something with all of them
 	// keep track of the server fd's returned by accept
 
 	struct reduce_arg *ra = arg;
 
+	int rv = 0;
+	
+	if (ra->mr->reduce == NULL)
+	   rv = -1;
+
+	int i;
+		for (i = 0; i < ra->mr->nmaps; i++) {
+		ra->mr->acceptedserverfd[i] = accept(ra->mr->clifd[i], (struct sockaddr *)&ra->mr->client_addr, &ra->mr->clilen);
+		if (ra->mr->acceptedserverfd[i] < 0)
+			perror("Failed to accept");
+		}
+
 	// Run reduce callback
-	int rv = ra->mr->reduce(ra->mr, ra->outfd, ra->mr->nmaps);
+	if (rv >= 0)
+	    rv = ra->mr->reduce(ra->mr, ra->outfd, ra->mr->nmaps);
 
 	// Close output file
 	close(ra->outfd);
@@ -132,6 +155,12 @@ mr_create(map_fn map, reduce_fn reduce, int nmaps)
 		goto err_clifd;
 	}
 
+	mr->acceptedserverfd = malloc((nmaps * sizeof(int)));
+	if (!mr->acceptedserverfd) {
+		perror("malloc(acceptedserverfd)");
+		goto err_acceptedserverfd;
+	}
+
 	// Fill in remaining fields
 	mr->nmaps = nmaps;
 	mr->map = map;
@@ -153,6 +182,8 @@ mr_create(map_fn map, reduce_fn reduce, int nmaps)
 	free(mr);
            err_clifd:
 	free(mr->clifd);
+	   err_acceptedserverfd:
+	free(mr->acceptedserverfd);
 	return NULL;
 }
 
@@ -160,11 +191,17 @@ mr_create(map_fn map, reduce_fn reduce, int nmaps)
 void
 mr_destroy(struct map_reduce *mr)
 {
-	//free(mr->buffers);
 	free(mr->map_threads);
+	if (mr->map == NULL)
+	    close(mr->serverfd);
+	 if (mr->reduce == NULL) {
+		int i;
+		for (i = 0; i < mr->nmaps; i++)
+	     		close(mr->clifd[i]);
+		//	close(mr->acceptedserverfd[i]);
+	}
 	free(mr->clifd);
-	//close(mr->sock_s);
-	//close(mr->sock_c);
+	free(mr->acceptedserverfd);
 	free(mr);
 }
 
@@ -174,6 +211,16 @@ mr_start(struct map_reduce *mr, const char *path, const char *ip, uint16_t port)
 {
 	int fd = 0;
 
+	// give addresses values
+	memset(&mr->server_addr, 0, sizeof(mr->server_addr));
+	memset(&mr->client_addr, 0, sizeof(mr->client_addr));
+	mr->server_addr.sin_family = AF_INET;
+	inet_pton(AF_INET, ip, &mr->server_addr.sin_addr);
+	mr->server_addr.sin_port = htons(port);
+
+
+	if (mr->map != NULL) {
+	
 	// create sockets for map threads
 	int r;
 	for (r = 0; r < mr->nmaps; r++) {
@@ -218,7 +265,9 @@ mr_start(struct map_reduce *mr, const char *path, const char *ip, uint16_t port)
 		// If this succeeds, the thread is now responsible to clean up
 		// the resources we passed to it.
 	}
+	}
 
+	else if (mr->reduce != NULL) {
 	// Set up reduce args
 	struct reduce_arg *ra = malloc(sizeof(*ra));
 	if (!ra) {
@@ -226,6 +275,8 @@ mr_start(struct map_reduce *mr, const char *path, const char *ip, uint16_t port)
 		close(fd);
 		return 1;
 	}
+
+	fd = open(path, O_WRONLY);
 	ra->mr = mr;
 	ra->outfd = fd;
 
@@ -236,9 +287,6 @@ mr_start(struct map_reduce *mr, const char *path, const char *ip, uint16_t port)
 	}
 
 	// use bind() to tell the server socket its information
-	mr->server_addr.sin_family = AF_INET;
-	mr->server_addr.sin_addr.s_addr = INADDR_ANY;
-	mr->server_addr.sin_port = htons(port);
 
 	if (bind(mr->serverfd, (struct sockaddr*)&mr->server_addr, sizeof(mr->server_addr)) < 0)
 	   perror("Error upon binding");
@@ -254,23 +302,12 @@ mr_start(struct map_reduce *mr, const char *path, const char *ip, uint16_t port)
 		return 1;
 	}
 
-	// what is argv[1] for server = gethostbyname?
-	//mr->server = gethostbyname("localhost");
-	//mr->server_addr.sin_family = AF_INET;
-	//mr->client_addr.sin_family = AF_INET;
-	//mr->server_addr.sin_port = htons(port);
-	//if (bind(mr->sock_s, (struct sockaddr*)&mr->server_addr, sizeof(mr->server_addr)) < 0)
-	 // perror("Error on binding\n");
-
 	mr->clilen = sizeof(mr->client_addr);
 
-	//if (connect(mr->sock_s, (struct sockaddr*)&mr->server_addr, sizeof(mr->server_addr)) < 0)
-	  //perror("Error connecting to server\n");
+	}
 
-	//mr->newsock_s = accept(mr->sock_s, (struct sockaddr*)&mr->client_addr, &mr->clilen);
-	//if (mr->newsock_s < 0)
-	  //perror("Error accepting\n");
-
+	else
+	  return -1;
 	// If this succeeds, the thread is now responsible to clean up the
 	// resources we passed to it.
 
@@ -283,32 +320,41 @@ mr_finish(struct map_reduce *mr)
 {
 	int rv = 0;
 
+
 	// Join with each of the map threads
 	int i;
 	void *void_rv;
 	struct return_val *thread_rv;
-	for (i = 0; i < mr->nmaps; i++) {
-		if (pthread_join(mr->map_threads[i], &void_rv)) {
-			perror("pthread_join(map)");
-			return 1;
+	if (mr->map != NULL) {
+		for (i = 0; i < mr->nmaps; i++) {
+			if (pthread_join(mr->map_threads[i], &void_rv)) {
+				perror("pthread_join(map)");
+				return 1;
+			}
+			thread_rv = void_rv;
+			if (!thread_rv || thread_rv->rv != 0)
+				rv = 1;
+			// free(NULL) is safe by POSIX
+			free(thread_rv);
 		}
-		thread_rv = void_rv;
-		if (!thread_rv || thread_rv->rv != 0)
-			rv = 1;
-		// free(NULL) is safe by POSIX
-		free(thread_rv);
 	}
 
+	//free(thread_rv);
+
 	// Join with the reduce thread
-	if (pthread_join(mr->reduce_thread, &void_rv)) {
-		perror("pthread_join(reduce)");
-		return 1;
-	}
+	if (mr->reduce != NULL) {
+		if (pthread_join(mr->reduce_thread, &void_rv)) {
+			perror("pthread_join(reduce)");
+			return 1;
+		}
+	
 	thread_rv = void_rv;
 	if (!thread_rv || thread_rv->rv != 0)
 		rv = 1;
 	// free(NULL) is safe by POSIX
-	free(thread_rv);
+	if (thread_rv != NULL)
+		free(thread_rv);
+	}
 
 	return rv;
 }
