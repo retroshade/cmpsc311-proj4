@@ -75,6 +75,7 @@ struct map_reduce {
   int newsock_s;
   int *clifd;
   int serverfd;
+  int *acceptedserverfd;
 };
 
 /**
